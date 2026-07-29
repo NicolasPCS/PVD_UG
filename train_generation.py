@@ -184,9 +184,22 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
 
-    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
+    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool,
+                        return_pred_xstart: bool, guidance=None):
 
-        model_output = denoise_fn(data, t)
+        if guidance is None or not guidance.active:
+            model_output = denoise_fn(data, t)
+        else:
+            # For a given timestep, extract alpha. Used to reconstruct x_0
+            alpha_bar = self._extract(
+                self.alphas_cumprod.to(data.device), t, data.shape)
+            model_output = guidance.guide_noise(
+                x_t=data,
+                timestep=t,
+                alpha_bar=alpha_bar,
+                predict_eps=lambda x_t: denoise_fn(x_t, t),
+                decode_x0=lambda x_0: x_0.transpose(1, 2),
+            )
 
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
@@ -229,12 +242,14 @@ class GaussianDiffusion:
 
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False):
+    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False,
+                 return_pred_xstart=False, guidance=None):
         """
         Sample from the model
         """
-        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
-                                                                 return_pred_xstart=True)
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
+            denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
+            return_pred_xstart=True, guidance=guidance)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
         assert noise.shape == data.shape
         # no noise when t == 0
@@ -246,7 +261,8 @@ class GaussianDiffusion:
 
 
     def p_sample_loop(self, denoise_fn, shape, device,
-                      noise_fn=torch.randn, clip_denoised=True, keep_running=False):
+                      noise_fn=torch.randn, clip_denoised=True, keep_running=False,
+                      guidance=None):
         """
         Generate samples
         keep_running: True if we run 2 x num_timesteps, False if we just run num_timesteps
@@ -258,7 +274,8 @@ class GaussianDiffusion:
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
-                                  clip_denoised=clip_denoised, return_pred_xstart=False)
+                                  clip_denoised=clip_denoised, return_pred_xstart=False,
+                                  guidance=guidance)
 
         assert img_t.shape == shape
         return img_t
@@ -443,10 +460,10 @@ class Model(nn.Module):
 
     def gen_samples(self, shape, device, noise_fn=torch.randn,
                     clip_denoised=True,
-                    keep_running=False):
+                    keep_running=False, guidance=None):
         return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
-                                            keep_running=keep_running)
+                                            keep_running=keep_running, guidance=guidance)
 
     def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
                     clip_denoised=True,keep_running=False):

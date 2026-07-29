@@ -91,7 +91,12 @@ class PVConv(nn.Module):
         features, coords, temb = inputs
         voxel_features, voxel_coords = self.voxelization(features, coords)
         voxel_features = self.voxel_layers(voxel_features)
-        voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
+        voxel_features = F.trilinear_devoxelize(
+            voxel_features,
+            voxel_coords,
+            self.resolution,
+            self.training or torch.is_grad_enabled(),
+        )
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
 
@@ -127,6 +132,11 @@ class PVConvReLU(nn.Module):
         features, coords, temb = inputs
         voxel_features, voxel_coords = self.voxelization(features, coords)
         voxel_features = self.voxel_layers(voxel_features)
-        voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
+        voxel_features = F.trilinear_devoxelize(
+            voxel_features,
+            voxel_coords,
+            self.resolution,
+            self.training or torch.is_grad_enabled(),
+        )
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
