@@ -1,7 +1,5 @@
 import torch
-from pprint import pprint
-from metrics.evaluation_metrics import jsd_between_point_cloud_sets as JSD
-from metrics.evaluation_metrics import compute_all_metrics, EMD_CD
+import json
 
 import torch.nn as nn
 import torch.utils.data
@@ -16,6 +14,7 @@ from model.pvcnn_generation import PVCNN2Base
 from tqdm import tqdm
 
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from modules.guidance.threed_universal_guidance import make_guidance
 
 '''
 models
@@ -48,7 +47,6 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
              torch.log(torch.max(cdf_delta, torch.ones_like(cdf_delta)*1e-12))))
     assert log_probs.shape == x.shape
     return log_probs
-
 
 class GaussianDiffusion:
     def __init__(self,betas, loss_type, model_mean_type, model_var_type):
@@ -102,8 +100,6 @@ class GaussianDiffusion:
         assert out.shape == torch.Size([bs])
         return torch.reshape(out, [bs] + ((len(x_shape) - 1) * [1]))
 
-
-
     def q_mean_variance(self, x_start, t):
         mean = self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start
         variance = self._extract(1. - self.alphas_cumprod.to(x_start.device), t, x_start.shape)
@@ -122,7 +118,6 @@ class GaussianDiffusion:
                 self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise
         )
 
-
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0)
@@ -138,11 +133,20 @@ class GaussianDiffusion:
                 x_start.shape[0])
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool, guidance=None):
 
-    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
-
-        model_output = denoise_fn(data, t)
-
+        if guidance is None:
+            model_output = denoise_fn(data, t)
+        else:
+            # For a given timestep, extract alpha. Used to reconstruct x_0
+            alpha_bar = self._extract(self.alphas_cumprod.to(data.device), t, data.shape)
+            model_output = guidance.guide_noise(
+                x_t=data,
+                timestep=t,
+                alpha_bar=alpha_bar,
+                predict_eps=lambda x_t: denoise_fn(x_t, t),
+                decode_x0=lambda x_0: x_0.transpose(1,2)
+            )
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
             # below: only log_variance is used in the KL computations
@@ -167,7 +171,6 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
 
-
         assert model_mean.shape == x_recon.shape == data.shape
         assert model_variance.shape == model_log_variance.shape == data.shape
         if return_pred_xstart:
@@ -184,12 +187,11 @@ class GaussianDiffusion:
 
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False, use_var=True):
+    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False, use_var=True, guidance=None):
         """
         Sample from the model
         """
-        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
-                                                                 return_pred_xstart=True)
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised, return_pred_xstart=True, guidance=guidance)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
         assert noise.shape == data.shape
         # no noise when t == 0
@@ -201,10 +203,9 @@ class GaussianDiffusion:
         assert sample.shape == pred_xstart.shape
         return (sample, pred_xstart) if return_pred_xstart else sample
 
-
     def p_sample_loop(self, denoise_fn, shape, device,
                       noise_fn=torch.randn, constrain_fn=lambda x, t:x,
-                      clip_denoised=True, max_timestep=None, keep_running=False):
+                      clip_denoised=True, max_timestep=None, keep_running=False, guidance=None):
         """
         Generate samples
         keep_running: True if we run 2 x num_timesteps, False if we just run num_timesteps
@@ -220,9 +221,7 @@ class GaussianDiffusion:
         for t in reversed(range(0, final_time if not keep_running else len(self.betas))):
             img_t = constrain_fn(img_t, t)
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
-                                  clip_denoised=clip_denoised, return_pred_xstart=False).detach()
-
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn, clip_denoised=clip_denoised, return_pred_xstart=False, guidance=guidance).detach()
 
         assert img_t.shape == shape
         return img_t
@@ -241,10 +240,8 @@ class GaussianDiffusion:
             t_ = torch.empty(x0.shape[0], dtype=torch.int64, device=x0.device).fill_(k)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
                                   clip_denoised=False, return_pred_xstart=False, use_var=True).detach()
-
-
+            
         return img_t
-
 
 class PVCNN2(PVCNN2Base):
     sa_blocks = [
@@ -268,8 +265,6 @@ class PVCNN2(PVCNN2Base):
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
 
-
-
 class Model(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
         super(Model, self).__init__()
@@ -290,7 +285,6 @@ class Model(nn.Module):
             'prior_bpd_b': prior_bpd_b,
             'mse_bt':mse_bt
         }
-
 
     def _denoise(self, data, t):
         B, D,N= data.shape
@@ -314,13 +308,8 @@ class Model(nn.Module):
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, shape, device, noise_fn=torch.randn, constrain_fn=lambda x, t:x,
-                    clip_denoised=False, max_timestep=None,
-                    keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
-                                            constrain_fn=constrain_fn,
-                                            clip_denoised=clip_denoised, max_timestep=max_timestep,
-                                            keep_running=keep_running)
+    def gen_samples(self, shape, device, noise_fn=torch.randn, constrain_fn=lambda x, t:x, clip_denoised=False, max_timestep=None, keep_running=False, guidance=None):
+        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn, constrain_fn=constrain_fn, clip_denoised=clip_denoised, max_timestep=max_timestep, keep_running=keep_running, guidance=guidance)
 
     def reconstruct(self, x0, t, constrain_fn=lambda x, t:x):
 
@@ -334,7 +323,6 @@ class Model(nn.Module):
 
     def multi_gpu_wrapper(self, f):
         self.model = f(self.model)
-
 
 def get_betas(schedule_type, b_start, b_end, time_num):
     if schedule_type == 'linear':
@@ -360,7 +348,6 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 def get_constrain_function(ground_truth, mask, eps, num_steps=1):
     '''
-
     :param target_shape_constraint: target voxels
     :return: constrained x
     '''
@@ -370,11 +357,8 @@ def get_constrain_function(ground_truth, mask, eps, num_steps=1):
         eps_ =  eps_all[t] if (t<1000) else 0
         for _ in range(num_steps):
             x  = x - eps_ * ((x - ground_truth) * mask)
-
-
         return x
     return constrain_fn
-
 
 #############################################################################
 
@@ -400,59 +384,21 @@ def get_dataset(dataroot, npoints,category,use_mask=False):
     )
     return tr_dataset, te_dataset
 
-def evaluate_gen(opt, ref_pcs, logger):
-
-    if ref_pcs is None:
-        _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category, use_mask=False)
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size,
-                                                      shuffle=False, num_workers=int(opt.workers), drop_last=False)
-        ref = []
-
-        for data in tqdm(test_dataloader, total=len(test_dataloader), desc='Generating Samples'):
-        #for i, data in tqdm(cycle(test_dataloader), total=num_samples, desc='Generating Samples'):
-            x = data['test_points']
-            m, s = data['mean'].float(), data['std'].float()
-
-            ref.append(x*s + m)
-
-        ref_pcs = torch.cat(ref, dim=0).contiguous()
-
-    logger.info("Loading sample path: %s"
-      % (opt.eval_path))
-    sample_pcs = torch.load(opt.eval_path).contiguous()
-
-    logger.info("Generation sample size:%s reference size: %s"
-          % (sample_pcs.size(), ref_pcs.size()))
-
-
-    # Compute metrics
-    results = compute_all_metrics(sample_pcs, ref_pcs, opt.batch_size)
-    results = {k: (v.cpu().detach().item()
-                   if not isinstance(v, float) else v) for k, v in results.items()}
-
-    pprint(results)
-    logger.info(results)
-
-    jsd = JSD(sample_pcs.numpy(), ref_pcs.numpy())
-    pprint('JSD: {}'.format(jsd))
-    logger.info('JSD: {}'.format(jsd))
-
-from itertools import cycle
-
-def generate(model, opt):
+def generate(model, opt, guidance):
 
     _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
 
-    sampler = torch.utils.data.RandomSampler(test_dataset, replacement=True, num_samples=1000)
+    sampler = torch.utils.data.RandomSampler(test_dataset, replacement=True, num_samples=opt.num_samples)
 
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size, sampler=sampler,
-                                                  shuffle=False, num_workers=int(opt.workers), drop_last=False)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size, sampler=sampler, shuffle=False, num_workers=int(opt.workers), drop_last=False)
 
     with torch.no_grad():
 
         samples = []
         ref = []
         cont = 1
+        mean_cd_per_sample = {}
+        sample_counter = 0 
 
         for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
             x = data['test_points'].transpose(1,2)
@@ -460,7 +406,22 @@ def generate(model, opt):
 
             print("x.shape", x.shape)
 
-            gen = model.gen_samples(x.shape, 'cuda', clip_denoised=False).detach().cpu()
+            guidance.losses_per_step = []
+            guidance.sampler_calls = 0
+
+            gen = model.gen_samples(x.shape, 'cuda', clip_denoised=False, guidance=guidance).detach().cpu()
+
+            for index in range(x.shape[0]):
+                cd_by_timestep = {
+                    str(record["timestep"]) : float(record["loss_per_sample"][index].item())
+                    for record in guidance.losses_per_step
+                }
+
+                mean_cd = sum(cd_by_timestep.values()) / len(cd_by_timestep)
+
+                mean_cd_per_sample[f"{sample_counter} normalized"] = mean_cd
+
+                sample_counter += 1
 
             gen = gen.transpose(1,2).contiguous()
             x = x.transpose(1,2).contiguous()
@@ -469,8 +430,6 @@ def generate(model, opt):
             x = x * s + m
             samples.append(gen)
             ref.append(x)
-
-            #visualize_pointcloud_batch(os.path.join(str(Path(opt.eval_path).parent), f'x_{cont}.png'), gen[:64], None, None, None)
             
             cont += 1
 
@@ -478,12 +437,30 @@ def generate(model, opt):
         ref = torch.cat(ref, dim=0)
 
         torch.save(samples, opt.eval_path)
+        torch.save(ref, opt.ref_path)
+        with open(opt.eval_path_cd_json, "w") as handle:
+            json.dump(mean_cd_per_sample, handle, indent=2)
 
     return ref
 
+def build_guidance(opt):
+    return make_guidance(
+        kind=opt.guidance_mode,
+        scale=opt.guidance_scale,
+        plane_normal=parse_vector(opt.plane_normal),
+        plane_point=parse_vector(opt.plane_point),
+        rotation_axis=parse_vector(opt.rotation_axis),
+        rotation_center=parse_vector(opt.rotation_center),
+        rotation_order=opt.rotation_order,
+        max_grad_norm=opt.max_grad_norm,
+        apply_every=opt.guidance_every,
+        verbose=opt.verbose_guidance
+    )
+
+def parse_vector(t):
+    return tuple(float(value.strip()) for value in t.split(","))
 
 def main(opt):
-
     if opt.category == 'airplane':
         opt.beta_start = 1e-5
         opt.beta_end = 0.008
@@ -491,7 +468,7 @@ def main(opt):
 
     exp_id = os.path.splitext(os.path.basename(__file__))[0]
     dir_id = os.path.dirname(__file__)
-    output_dir = get_output_dir(dir_id, exp_id)
+    output_dir = get_output_dir(dir_id, exp_id, opt.category, opt.guidance_mode)
     copy_source(__file__, output_dir)
     logger = setup_logging(output_dir)
 
@@ -509,69 +486,72 @@ def main(opt):
     model = model.cuda()
     model.multi_gpu_wrapper(_transform_)
 
+    logger.info("Resume Path:%s" % opt.model)
+    
+    resumed_param = torch.load(opt.model)
+    model.load_state_dict(resumed_param['model_state'])
+
+    #print("model", model)
+
     model.eval()
 
+    guidance = build_guidance(opt)
+
     with torch.no_grad():
-
-        logger.info("Resume Path:%s" % opt.model)
-
-        resumed_param = torch.load(opt.model)
-        model.load_state_dict(resumed_param['model_state'])
-
-        print("model", model)
-
         ref = None
         if opt.generate:
             opt.eval_path = os.path.join(outf_syn, 'samples.pth')
+            opt.ref_path = os.path.join(outf_syn, 'reference.pth')
+            opt.eval_path_cd_json = os.path.join(outf_syn, 'computed_mean_cd_per_sample.json')
             Path(opt.eval_path).parent.mkdir(parents=True, exist_ok=True)
-            ref=generate(model, opt)
-            
-        if opt.eval_gen:
-            # Evaluate generation
-            #evaluate_gen(opt, ref, logger)
-            pass
-
+            ref=generate(model, opt, guidance)
 
 def parse_args():
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataroot', default='/home/ncaytuir/data/Datasets/ShapeNetCore.v6.PC15k')
+    parser.add_argument('--dataroot', default='/home/isipiran/Datasets/ShapeNetCore.v2.PC15k')
     parser.add_argument('--category', default='chair')
-
     parser.add_argument('--batch_size', type=int, default=100, help='input batch size')
     parser.add_argument('--workers', type=int, default=16, help='workers')
     parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
-
     parser.add_argument('--generate',default=True)
     parser.add_argument('--eval_gen', default=False)#True
-
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)
+
     '''model'''
+
     parser.add_argument('--beta_start', default=0.0001)
     parser.add_argument('--beta_end', default=0.02)
     parser.add_argument('--schedule_type', default='linear')
     parser.add_argument('--time_num', default=1000)
 
-    #params
     parser.add_argument('--attention', default=True)
     parser.add_argument('--dropout', default=0.1)
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
-
-
     parser.add_argument('--model', default='',required=False, help="path to model (to continue training)")
 
     '''eval'''
 
-    parser.add_argument('--eval_path',
-                        default='')
-
+    parser.add_argument('--eval_path', default='')
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
-
     parser.add_argument('--gpu', type=int, default=0, metavar='S', help='gpu id (default: 0)')
+    parser.add_argument("--num_samples", type=int, default=1000)
+
+    '''guidance'''
+
+    parser.add_argument("--guidance_mode", choices=("baseline", "reflection", "rotation"), default="baseline")
+    parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--guidance_every", type=float, default=1)
+    parser.add_argument("--plane_normal", default="1,0,0")
+    parser.add_argument("--plane_point", default="0,0,0")
+    parser.add_argument("--rotation_axis", default="0,1,0")
+    parser.add_argument("--rotation_center", default="0,0,0")
+    parser.add_argument("--rotation_order", type=float, default=2)
+    parser.add_argument("--verbose_guidance", action="store_true")
 
     opt = parser.parse_args()
 
@@ -584,65 +564,11 @@ def parse_args():
 
 if __name__ == '__main__':
     opt = parse_args()
-    #opt.category = 'chair'
-    #opt.batch_size = 50 #5
+    opt.category = 'airplane'
+    opt.batch_size = 50
     opt.generate = True
     opt.eval_gen = False
-    #opt.model = '/home/ncaytuir/data-local/PVD_necs/checkpoints/ckpt_original_chair_1799.pth'
+    opt.model = '/home/isipiran/Symmetry-Matters/Baselines_Checkpoints/PVD/original/ckpt_original_airplane_2899.pth'
     set_seed(opt)
 
     main(opt)
-
-""" Sobre airplane
-########################################################### Época 2899 (original)
-Sobre BS: 50
-{'1-NN-CD-acc': 0.7358024716377258,
- '1-NN-CD-acc_f': 0.6617283821105957,
- '1-NN-CD-acc_t': 0.809876561164856,
- '1-NN-EMD-acc': 0.6012345552444458,
- '1-NN-EMD-acc_f': 0.5283950567245483,
- '1-NN-EMD-acc_t': 0.6740740537643433,
- 'lgan_cov-CD': 0.4839506149291992,
- 'lgan_cov-EMD': 0.5333333611488342,
- 'lgan_mmd-CD': 0.00022542446095030755,
- 'lgan_mmd-EMD': 0.0035789310932159424,
- 'lgan_mmd_smp-CD': 0.0007010097033344209,
- 'lgan_mmd_smp-EMD': 0.007091946434229612}
-2025-08-20 13:20:17,997 : JSD: 0.04351473113079862
-"""
-
-""" Sobre car
-########################################################### Época 3999 (original)
-Sobre BS: 50
-{'1-NN-CD-acc': 0.5838068127632141,
- '1-NN-CD-acc_f': 0.6676136255264282,
- '1-NN-CD-acc_t': 0.5,
- '1-NN-EMD-acc': 0.5454545617103577,
- '1-NN-EMD-acc_f': 0.5738636255264282,
- '1-NN-EMD-acc_t': 0.5170454382896423,
- 'lgan_cov-CD': 0.4630681872367859,
- 'lgan_cov-EMD': 0.49715909361839294,
- 'lgan_mmd-CD': 0.0010250993072986603,
- 'lgan_mmd-EMD': 0.007565687410533428,
- 'lgan_mmd_smp-CD': 0.0008618682622909546,
- 'lgan_mmd_smp-EMD': 0.00733407586812973}
-2025-08-27 15:28:00,787 : JSD: 0.009442442750211555
-"""
-
-""" Sobre chair
-########################################################### Época 1799 (original)
-Sobre BS: 50
-{'1-NN-CD-acc': 0.5770393013954163,
- '1-NN-CD-acc_f': 0.69486403465271,
- '1-NN-CD-acc_t': 0.4592145085334778,
- '1-NN-EMD-acc': 0.5453172326087952,
- '1-NN-EMD-acc_f': 0.6057401895523071,
- '1-NN-EMD-acc_t': 0.4848942458629608,
- 'lgan_cov-CD': 0.47129908204078674,
- 'lgan_cov-EMD': 0.5075528621673584,
- 'lgan_mmd-CD': 0.0026015674229711294,
- 'lgan_mmd-EMD': 0.015494581311941147,
- 'lgan_mmd_smp-CD': 0.002403168473392725,
- 'lgan_mmd_smp-EMD': 0.015306074172258377}
-2025-08-27 17:04:47,036 : JSD: 0.01629148209160114
-"""

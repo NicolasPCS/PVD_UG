@@ -95,7 +95,7 @@ class PVConv(nn.Module):
             voxel_features,
             voxel_coords,
             self.resolution,
-            self.training or torch.is_grad_enabled(),
+            self.training or torch.is_grad_enabled(), # Enabling grad for guidance
         )
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
@@ -136,7 +136,7 @@ class PVConvReLU(nn.Module):
             voxel_features,
             voxel_coords,
             self.resolution,
-            self.training or torch.is_grad_enabled(),
+            self.training or torch.is_grad_enabled(), # Enabling grad for guidance
         )
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
