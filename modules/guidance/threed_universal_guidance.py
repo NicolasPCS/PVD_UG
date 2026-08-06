@@ -44,7 +44,7 @@ class UniversalGuidance:
             pred_x0 = (x_in - sqrt_one_minus_alpha * eps_prediction) / sqrt_alpha
             # Convert [B,3,N] to [B,N,3] and compute symmetry loss
             decoded_points = decode_x0(pred_x0)
-            loss_per_sample = self.loss_fn(decoded_points, reduction="none")
+            loss_per_sample = self.loss_fn(decoded_points)
             if loss_per_sample.ndim == 0:
                 loss_per_sample = loss_per_sample.reshape(1)
 
@@ -88,7 +88,7 @@ class UniversalGuidance:
                 print(record)
 
             # Correct epsilon with symmetric gradient
-            guided_eps = (eps_prediction + self.scale * sqrt_one_minus_alpha * effective_gradient)
+            guided_eps = (eps_prediction + self.scale * effective_gradient)
             return guided_eps.detach()
 
 def make_guidance(
@@ -103,6 +103,7 @@ def make_guidance(
     verbose="False"
 ):
     if kind.lower() in ("baseline", "reflection"):
+        print(f"[DEBUG_guidance] guidance kind = {kind}")
         loss_fn = partial(
             reflection_symmetry_loss,
             plane_normal=plane_normal,

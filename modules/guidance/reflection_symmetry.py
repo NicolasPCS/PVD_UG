@@ -25,10 +25,17 @@ def compute_diagonal(points):
 
     return diagonal.clamp_min(1e-12)
 
-def reflection_symmetry_loss(points, plane_normal=(1.0, 0.0, 0.0), plane_point=(0.0, 0.0, 0.0), reduction="mean"):
-    reflected = reflect_points(points=points, plane_normal=plane_normal, plane_point=plane_point)
+def reflection_symmetry_loss(points, plane_normal=(1.0, 0.0, 0.0), plane_point=(0.0, 0.0, 0.0)):
+    points_bnc, _ = as_bnc(points)
 
-    cd = chamfer_distance(points, reflected, reduction=reduction)
-    diag = compute_diagonal(points)
+    # Center each sample in x
+    centroid_x = points_bnc[:, :, 0].mean(dim=1, keepdim=True)
+    centered_points = points_bnc.clone()
+    centered_points[:, :, 0] = (centered_points[:, :, 0] - centroid_x)
+
+    reflected = reflect_points(points=centered_points, plane_normal=plane_normal, plane_point=plane_point)
+
+    cd = chamfer_distance(centered_points, reflected)
+    diag = compute_diagonal(centered_points).detach()
     
-    return cd/diag.square()
+    return cd/diag#.square()

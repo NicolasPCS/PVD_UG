@@ -437,7 +437,7 @@ def generate(model, opt, guidance):
         ref = torch.cat(ref, dim=0)
 
         torch.save(samples, opt.eval_path)
-        torch.save(ref, opt.ref_path)
+        #torch.save(ref, opt.ref_path)
         with open(opt.eval_path_cd_json, "w") as handle:
             json.dump(mean_cd_per_sample, handle, indent=2)
 
@@ -468,11 +468,11 @@ def main(opt):
 
     exp_id = os.path.splitext(os.path.basename(__file__))[0]
     dir_id = os.path.dirname(__file__)
-    output_dir = get_output_dir(dir_id, exp_id, opt.category, opt.guidance_mode)
+    output_dir = get_output_dir(dir_id, exp_id, opt.category, opt.guidance_mode, opt.guidance_scale)
     copy_source(__file__, output_dir)
     logger = setup_logging(output_dir)
 
-    outf_syn, = setup_output_subdirs(output_dir, 'syn')
+    outf_syn, = setup_output_subdirs(output_dir, 'guidance')
 
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
     model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
@@ -510,7 +510,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot', default='/home/isipiran/Datasets/ShapeNetCore.v2.PC15k')
     parser.add_argument('--category', default='chair')
-    parser.add_argument('--batch_size', type=int, default=100, help='input batch size')
+    parser.add_argument('--batch_size', type=int, default=50, help='input batch size')
     parser.add_argument('--workers', type=int, default=16, help='workers')
     parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
     parser.add_argument('--generate',default=True)
@@ -564,11 +564,5 @@ def parse_args():
 
 if __name__ == '__main__':
     opt = parse_args()
-    opt.category = 'airplane'
-    opt.batch_size = 50
-    opt.generate = True
-    opt.eval_gen = False
-    opt.model = '/home/isipiran/Symmetry-Matters/Baselines_Checkpoints/PVD/original/ckpt_original_airplane_2899.pth'
     set_seed(opt)
-
     main(opt)

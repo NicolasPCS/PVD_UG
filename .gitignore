@@ -1,6 +1,6 @@
 .idea
 data
-output
+output*
 __pycache__
 *.png
 *.net

@@ -10,19 +10,14 @@ def as_bnc(points):
     raise ValueError("Expected point layout [B,N,3] or [B,3,N], got {}".format(tuple(points.shape)))
 
 def pairwise_dist(x, y):
-    dists = torch.cdist(x.float(), y.float()).square()
+    dists = torch.cdist(x.float(), y.float())#.square()
     return dists.amin(dim=2).mean(dim=1)
 
-def chamfer_distance(x, y, reduction="mean"):
+def chamfer_distance(x, y):
     x_bnc, _ = as_bnc(x)
     y_bnc, _ = as_bnc(y)
     first_term = pairwise_dist(x_bnc, y_bnc)
     second_term = pairwise_dist(y_bnc, x_bnc)
     per_sample = first_term + second_term
 
-    if reduction == "none":
-        return per_sample
-    if reduction == "mean":
-        return per_sample.mean()
-    if reduction == "sum":
-        return per_sample.sum()
+    return per_sample
